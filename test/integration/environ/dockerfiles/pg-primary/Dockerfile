@@ -71,7 +71,7 @@ RUN echo "postgres:postgres" | chpasswd; \
 
 ######################################################################
 # Copy binaries (1)
-COPY --from=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z /usr/bin/mc /usr/local/bin/minio-mc
+COPY --from=docker.io/bitnamilegacy/minio-client:2025.7.21 /opt/bitnami/minio-client/bin/mc /usr/local/bin/minio-mc
 
 ######################################################################
 # Copy test scripts (these files are frequently changed, so it's better to make this layer as late as possible)

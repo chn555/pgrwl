@@ -1,1 +1,3 @@
-FROM quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+FROM docker.io/bitnamilegacy/minio-client:2025.7.21
+USER 0
+ENTRYPOINT []
