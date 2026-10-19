@@ -24,6 +24,11 @@ func wrapResponseWriter(w http.ResponseWriter) *responseWriter {
 	return &responseWriter{ResponseWriter: w}
 }
 
+// Unwrap lets http.ResponseController reach the underlying writer, for handlers that set deadlines.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 func (rw *responseWriter) Status() int {
 	return rw.status
 }
