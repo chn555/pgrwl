@@ -381,3 +381,20 @@ func setValidReceiveEnvForTest(t *testing.T) {
 	t.Setenv("PGRWL_STORAGE_S3_BUCKET", "env-bucket")
 	t.Setenv("PGRWL_STORAGE_S3_REGION", "us-east-1")
 }
+
+func TestCheckMarksConfigDefaultsAndParsesTheTimeout(t *testing.T) {
+	cfg := &Config{}
+	errs := checkMarksConfig(cfg, nil)
+	assert.Empty(t, errs)
+	assert.Equal(t, 120*time.Second, cfg.Marks.WALTimeoutParsed)
+
+	cfg = &Config{Marks: MarksConfig{WALTimeout: "45s"}}
+	errs = checkMarksConfig(cfg, nil)
+	assert.Empty(t, errs)
+	assert.Equal(t, 45*time.Second, cfg.Marks.WALTimeoutParsed)
+
+	for _, bad := range []string{"soon", "0s", "-1m"} {
+		errs = checkMarksConfig(&Config{Marks: MarksConfig{WALTimeout: bad}}, nil)
+		assert.Len(t, errs, 1, bad)
+	}
+}

@@ -55,6 +55,9 @@ const (
 	RepoCompressorZstd = "zstd"
 
 	RetentionTypeRecoveryWindow = "recovery_window"
+
+	// DefaultMarksWALTimeout is how long a mark waits for its segment when marks.wal_timeout is unset.
+	DefaultMarksWALTimeout = "120s"
 )
 
 var (
@@ -90,6 +93,7 @@ type Config struct {
 	DevConfig DevConfig       `json:"devconfig,omitzero"` // Various dev options.
 	Backup    BackupConfig    `json:"backup,omitzero"`    // Streaming basebackup options.
 	Retention RetentionConfig `json:"retention,omitzero"` // Retention worker (recovery-window)
+	Marks     MarksConfig     `json:"marks,omitzero"`     // Marks API (restore targets)
 }
 
 // MainConfig holds top-level application settings.
@@ -127,6 +131,14 @@ type RetentionConfig struct {
 	KeepDurationParsed time.Duration `json:"-"`
 
 	KeepLast *int `json:"keep_last,omitzero" env:"PGRWL_BACKUP_RETENTION_KEEP_LAST"`
+}
+
+// MarksConfig configures the marks API served in receive mode.
+type MarksConfig struct {
+	// WALTimeout bounds how long a mark waits for its WAL segment to reach storage; default 120s.
+	WALTimeout string `json:"wal_timeout,omitzero" env:"PGRWL_MARKS_WAL_TIMEOUT"`
+
+	WALTimeoutParsed time.Duration `json:"-"`
 }
 
 // ReceiveConfig configures the WAL receiving logic.
@@ -398,6 +410,7 @@ func validate(c *Config, mode string) error {
 	errs = checkStorageConfig(c, errs)
 	errs = checkStorageModifiersConfig(c, errs)
 	errs = checkBackupConfig(c, errs)
+	errs = checkMarksConfig(c, errs)
 
 	if len(errs) > 0 {
 		return errors.New("invalid config:\n  - " + strings.Join(errs, "\n  - "))
@@ -481,6 +494,20 @@ func checkBackupConfig(c *Config, errs []string) []string {
 	if strings.TrimSpace(c.Backup.Cron) == "" {
 		errs = append(errs, "backup.cron is required")
 	}
+	return errs
+}
+
+func checkMarksConfig(c *Config, errs []string) []string {
+	if strings.TrimSpace(c.Marks.WALTimeout) == "" {
+		c.Marks.WALTimeout = DefaultMarksWALTimeout
+	}
+
+	timeout, err := time.ParseDuration(c.Marks.WALTimeout)
+	if err != nil || timeout <= 0 {
+		errs = append(errs, fmt.Sprintf("marks.wal_timeout must be a positive duration, got %q", c.Marks.WALTimeout))
+		return errs
+	}
+	c.Marks.WALTimeoutParsed = timeout
 	return errs
 }
 
