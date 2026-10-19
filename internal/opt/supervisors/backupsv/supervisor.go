@@ -19,6 +19,7 @@ type BackupSupervisorOpts struct {
 	WalSegSz       uint64
 	BasebackupStor st.Storage
 	WalStor        *st.VariadicStorage
+	MarkStor       st.Storage // Optional; marks are pruned with their WAL when set.
 	Cfg            *config.Config
 }
 

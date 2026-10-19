@@ -10,6 +10,8 @@ import (
 	"github.com/pgrwl/pgrwl/config"
 	"github.com/pgrwl/pgrwl/internal/core/xlog"
 	"github.com/pgrwl/pgrwl/internal/opt/basebackup/backupdto"
+	"github.com/pgrwl/pgrwl/internal/opt/marks"
+	st "github.com/pgrwl/pgrwl/internal/opt/shared/storecrypt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -291,6 +293,46 @@ func TestRecoveryWindowRetentionRunBeforeBackupDeletesOldBackupsThenCleansWAL(t 
 	assert.Equal(t, []string{"20260422065500"}, store.deleted)
 	assert.Equal(t, 1, cleaner.calls)
 	assert.NotEmpty(t, cleaner.keepFromWAL)
+}
+
+func TestRecoveryWindowRetentionRunBeforeBackupPrunesMarksBeforeTheKeptWAL(t *testing.T) {
+	store := newFakeBackupStore()
+	store.dirs = map[string]bool{
+		"20260422065500": true,
+		"20260428065500": true,
+		"20260501065500": true,
+	}
+	now := time.Now().UTC()
+	store.manifests["20260422065500"] = manifestResultAt(t, now.Add(-10*24*time.Hour), 1, "0/1000000")
+	store.manifests["20260428065500"] = manifestResultAt(t, now.Add(-4*24*time.Hour), 1, "0/3000000")
+	store.manifests["20260501065500"] = manifestResultAt(t, now.Add(-24*time.Hour), 1, "0/5000000")
+
+	markFiles := st.NewInMemoryStorage()
+	markStore := &marks.Store{Storage: markFiles}
+	for _, walFile := range []string{
+		"000000010000000000000001",
+		"000000010000000000000002",
+		"000000010000000000000003",
+		"000000010000000000000004",
+	} {
+		m, err := marks.New("0/1", walFile, "", now)
+		require.NoError(t, err)
+		require.NoError(t, markStore.Put(context.Background(), &m))
+	}
+
+	cleaner := &fakeWALCleaner{}
+	retention := newRetentionForTest(retentionConfigForTest(), store, cleaner)
+	retention.marks = markStore
+
+	err := retention.RunBeforeBackup(context.Background())
+
+	require.NoError(t, err)
+	assert.Equal(t, "000000010000000000000003", cleaner.keepFromWAL)
+	left, err := markStore.List(context.Background())
+	require.NoError(t, err)
+	require.Len(t, left, 2)
+	assert.Equal(t, "000000010000000000000003", left[0].WALFile)
+	assert.Equal(t, "000000010000000000000004", left[1].WALFile)
 }
 
 func TestRecoveryWindowRetentionRunBeforeBackupDoesNotCleanWALIfBackupDeleteFails(t *testing.T) {

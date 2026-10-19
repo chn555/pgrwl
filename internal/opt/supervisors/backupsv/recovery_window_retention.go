@@ -11,6 +11,7 @@ import (
 	"github.com/pgrwl/pgrwl/internal/core/conv"
 	"github.com/pgrwl/pgrwl/internal/core/xlog"
 	"github.com/pgrwl/pgrwl/internal/opt/basebackup/backupdto"
+	"github.com/pgrwl/pgrwl/internal/opt/marks"
 )
 
 type recoveryWindowRetention struct {
@@ -18,15 +19,20 @@ type recoveryWindowRetention struct {
 	opts        *BackupSupervisorOpts
 	backupStore BackupStore
 	walCleaner  WALCleaner
+	marks       *marks.Store // Nil when the supervisor has no mark storage.
 }
 
 func newRecoveryWindowRetention(opts *BackupSupervisorOpts) *recoveryWindowRetention {
-	return &recoveryWindowRetention{
+	r := &recoveryWindowRetention{
 		l:           slog.With(slog.String("component", "recovery-window-retention")),
 		opts:        opts,
 		backupStore: NewBackupStore(opts),
 		walCleaner:  NewWALCleaner(opts),
 	}
+	if opts.MarkStor != nil {
+		r.marks = &marks.Store{Storage: opts.MarkStor}
+	}
+	return r
 }
 
 func (r *recoveryWindowRetention) RunBeforeBackup(ctx context.Context) error {
@@ -82,6 +88,24 @@ func (r *recoveryWindowRetention) RunBeforeBackup(ctx context.Context) error {
 		return fmt.Errorf("purge old WALs before %s: %w", anchor.beginWAL, err)
 	}
 
+	return r.pruneMarks(ctx, anchor.beginWAL)
+}
+
+// The pruneMarks method drops the marks whose WAL the cleaner just deleted, so no mark outlives its segment.
+func (r *recoveryWindowRetention) pruneMarks(ctx context.Context, keepFromWAL string) error {
+	if r.marks == nil {
+		return nil
+	}
+
+	deleted, err := r.marks.DeleteBefore(ctx, keepFromWAL)
+	if err != nil {
+		return fmt.Errorf("purge marks before %s: %w", keepFromWAL, err)
+	}
+
+	r.l.Info("mark retention completed",
+		slog.String("keep_from", keepFromWAL),
+		slog.Int("deleted_marks", deleted),
+	)
 	return nil
 }
 
