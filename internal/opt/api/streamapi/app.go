@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/pgrwl/pgrwl/internal/opt/api/streamapi/backupapi"
+	"github.com/pgrwl/pgrwl/internal/opt/api/streamapi/marksapi"
 	"github.com/pgrwl/pgrwl/internal/opt/api/streamapi/receiveapi"
 
 	"github.com/pgrwl/pgrwl/config"
@@ -19,6 +20,7 @@ import (
 type Opts struct {
 	Receive *receiveapi.Opts
 	Backup  *backupapi.Opts
+	Marks   *marksapi.Opts
 	Cfg     *config.Config
 }
 
@@ -28,6 +30,7 @@ func Init(o *Opts) http.Handler {
 	// init services/handlers
 	backupHandler := backupapi.NewHandler(backupapi.NewService(o.Backup))
 	receiveHandler := receiveapi.NewHandler(receiveapi.NewService(o.Receive))
+	marksHandler := marksapi.NewHandler(marksapi.NewService(o.Marks))
 
 	// init middlewares
 	loggingMiddleware := middleware.LoggingMiddleware{
@@ -57,6 +60,8 @@ func Init(o *Opts) http.Handler {
 	mux.Handle("GET /api/v1/redacted-config", secureChain(http.HandlerFunc(receiveHandler.FullRedactedConfig)))
 	mux.Handle("GET /api/v1/wals", secureChain(http.HandlerFunc(receiveHandler.WalsHandler)))
 	mux.Handle("GET /api/v1/backups", secureChain(http.HandlerFunc(receiveHandler.BackupsHandler)))
+	mux.Handle("POST /api/v1/marks", secureChain(http.HandlerFunc(marksHandler.Create)))
+	mux.Handle("GET /api/v1/marks", secureChain(http.HandlerFunc(marksHandler.List)))
 
 	initOptionalHandlers(o.Cfg, mux, l)
 	return mux
