@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/pgrwl/pgrwl/internal/opt/api/streamapi/backupapi"
+	"github.com/pgrwl/pgrwl/internal/opt/api/streamapi/marksapi"
 	"github.com/pgrwl/pgrwl/internal/opt/api/streamapi/receiveapi"
+	"github.com/pgrwl/pgrwl/internal/opt/marks"
 	"github.com/pgrwl/pgrwl/internal/opt/shared/retry"
 
 	"github.com/pgrwl/pgrwl/internal/opt/api/streamapi"
@@ -190,6 +192,11 @@ func RunReceiveMode(opts *ReceiveModeOpts) error {
 				Supervisor: comp.basebackupSupervisor,
 				AppCtx:     ctx,
 			},
+			Marks: &marksapi.Opts{
+				Store:      &marks.Store{Storage: comp.markStor},
+				WALStor:    comp.walStor,
+				WALTimeout: cfg.Marks.WALTimeoutParsed,
+			},
 			Cfg: cfg,
 		})
 
@@ -294,6 +301,7 @@ func RunReceiveMode(opts *ReceiveModeOpts) error {
 type components struct {
 	pgrw                 xlog.PgReceiveWal
 	walStor              *st.VariadicStorage
+	markStor             st.Storage
 	basebackupSupervisor backupsv.BaseBackupSupervisor
 }
 
@@ -341,11 +349,17 @@ func initComponents(
 		return nil, fmt.Errorf("init basebackup storage: %w", err)
 	}
 
+	markStor, err := initMarksStorage(cfg.Main.Directory)
+	if err != nil {
+		return nil, fmt.Errorf("init marks storage: %w", err)
+	}
+
 	basebackupSupervisor, err := backupsv.NewBaseBackupSupervisor(&backupsv.BackupSupervisorOpts{
 		Directory:      opts.ReceiveDirectory,
 		WalSegSz:       walSegSz,
 		BasebackupStor: basebackupStor,
 		WalStor:        walStor,
+		MarkStor:       markStor,
 		Cfg:            cfg,
 	})
 	if err != nil {
@@ -355,6 +369,7 @@ func initComponents(
 	return &components{
 		pgrw:                 pgrw,
 		walStor:              walStor,
+		markStor:             markStor,
 		basebackupSupervisor: basebackupSupervisor,
 	}, nil
 }
@@ -419,6 +434,18 @@ func initWalStorage(
 	}
 
 	return stor, nil
+}
+
+// The initMarksStorage function returns the raw backend so marks stay plain JSON whatever the WAL transform is.
+func initMarksStorage(baseDir string) (st.Storage, error) {
+	stor, err := api.SetupStorage(&api.SetupStorageOpts{
+		BaseDir: filepath.ToSlash(baseDir),
+		SubPath: marks.Subpath,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return stor.Backend, nil
 }
 
 func initBasebackupStorage(baseDir string) (st.Storage, error) {
