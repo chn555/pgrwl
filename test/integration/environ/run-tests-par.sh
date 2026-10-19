@@ -37,6 +37,7 @@ ALL_TESTS=(
   pg_012_restore_s3_toxiproxy
   pg_014_stream_api_bb
   pg_016_reconnect
+  pg_019_marks
 )
 
 if [[ $# -gt 0 ]]; then

@@ -97,6 +97,11 @@ services:
     container_name: pg_016_reconnect
     entrypoint: /var/lib/postgresql/scripts/tests/016-reconnect.sh
 
+  pg_019_marks:
+    <<: *pg_test_common
+    container_name: pg_019_marks
+    entrypoint: /var/lib/postgresql/scripts/tests/019-marks.sh
+
   sshd:
     build:
       context: .
