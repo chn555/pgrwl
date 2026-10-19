@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/pgrwl/pgrwl/internal/opt/shared/x/httpx"
 )
@@ -16,13 +17,18 @@ const (
 	maxLabelLength = 256
 )
 
+// The responseGrace is added to the WAL timeout so a 504 still reaches the client.
+const responseGrace = 5 * time.Second
+
 type Handler struct {
-	Service Service
+	Service    Service
+	WALTimeout time.Duration
 }
 
-func NewHandler(s Service) *Handler {
+func NewHandler(s Service, walTimeout time.Duration) *Handler {
 	return &Handler{
-		Service: s,
+		Service:    s,
+		WALTimeout: walTimeout,
 	}
 }
 
@@ -33,6 +39,11 @@ type createRequest struct {
 
 func (c *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
+	// A mark outlives the server's write timeout while it waits for the segment, so push the deadline out.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(c.WALTimeout + responseGrace)); err != nil {
+		slog.Warn("cannot extend the write deadline for a mark", slog.Any("err", err))
+	}
 
 	var req createRequest
 	err := httpx.ReadJSON(r, &req)

@@ -48,7 +48,7 @@ func newFixture(t *testing.T, switchWAL func(ctx context.Context) (*switchResult
 	impl.walPoll = 5 * time.Millisecond
 	impl.switchWAL = switchWAL
 
-	return &fixture{handler: NewHandler(s), svc: impl, walFiles: walFiles, marks: markFiles}
+	return &fixture{handler: NewHandler(s, impl.walTimeout), svc: impl, walFiles: walFiles, marks: markFiles}
 }
 
 // The switchToTestWAL stub stands in for pgSwitchWAL and always closes the same segment.

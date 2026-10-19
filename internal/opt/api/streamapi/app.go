@@ -30,7 +30,7 @@ func Init(o *Opts) http.Handler {
 	// init services/handlers
 	backupHandler := backupapi.NewHandler(backupapi.NewService(o.Backup))
 	receiveHandler := receiveapi.NewHandler(receiveapi.NewService(o.Receive))
-	marksHandler := marksapi.NewHandler(marksapi.NewService(o.Marks))
+	marksHandler := marksapi.NewHandler(marksapi.NewService(o.Marks), o.Marks.WALTimeout)
 
 	// init middlewares
 	loggingMiddleware := middleware.LoggingMiddleware{
