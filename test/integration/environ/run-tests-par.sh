@@ -66,7 +66,7 @@ fi
 
 # Start shared infra once; minio healthcheck ensures it is ready before returning
 echo "==> starting infra (minio, sshd, toxiproxy)..."
-_dc up -d minio sshd toxiproxy
+_dc up -d --wait minio sshd toxiproxy
 
 LOG_DIR="${SCRIPT_DIR}/test_logs"
 rm -rf "$LOG_DIR" && mkdir -p "$LOG_DIR"
