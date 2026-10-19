@@ -30,6 +30,9 @@ retention:                               # Optional
   value: 72h                             # Recovery window; keep enough backups/WALs to recover to any point in the last 72h
   keep_last: 1                           # Minimum number of successful backups to keep, even if outside/inside the recovery window
 
+marks:                                   # Optional
+  wal_timeout: 120s                      # How long POST /api/v1/marks waits for the switched WAL segment to reach storage
+
 log:                                     # Optional
   level: info                            # One of: (trace / debug / info / warn / error)
   format: text                           # One of: (text / pretty / json)
@@ -81,6 +84,7 @@ PGRWL_RETENTION_ENABLE                   # Enable recovery-window retention
 PGRWL_RETENTION_TYPE                     # Only supported retention policy
 PGRWL_RETENTION_VALUE                    # Recovery window; keep enough backups/WALs to recover to any point in the last 72h
 PGRWL_RETENTION_KEEP_LAST                # Minimum number of successful backups to keep, even if outside/inside the recovery window
+PGRWL_MARKS_WAL_TIMEOUT                  # How long POST /api/v1/marks waits for the switched WAL segment to reach storage
 PGRWL_LOG_LEVEL                          # One of: (trace / debug / info / warn / error)
 PGRWL_LOG_FORMAT                         # One of: (text / pretty / json)
 PGRWL_LOG_ADD_SOURCE                     # Include file:line in log messages (for local development)
