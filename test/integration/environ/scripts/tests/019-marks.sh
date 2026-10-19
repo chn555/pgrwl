@@ -3,25 +3,39 @@ set -euo pipefail
 . /var/lib/postgresql/scripts/tests/utils.sh
 
 ###############################################################################
-# Test: marks API and restore to a mark (S3, gzip + AES)
+# Test: marks API, retention of marks, and restore to a mark (S3 via its own
+# toxiproxy proxy, gzip + AES)
 #
 # What this verifies:
 #
 #   1. POST /api/v1/marks answers 201 once the switched segment is in the bucket.
-#   2. A second mark on an idle instance (nothing written since the first
-#      switch) still closes a fresh segment, so its LSN is reachable too.
-#   3. Mark objects land at marks/<id>.json and GET /api/v1/marks lists them
-#      in order.
-#   4. WAL written after the marks is archived too, so recovery has something
-#      beyond the target and must stop at the mark rather than at end of WAL.
-#   5. PGDATA is lost; the base backup is restored with
+#   2. A second POST while a mark is in progress answers 409; the first still
+#      completes. MinIO is slowed through toxiproxy so the window is wide.
+#   3. A mark on an idle instance (nothing written since the last switch)
+#      still closes a fresh segment, so its LSN is reachable too.
+#   4. Mark objects are plain JSON at marks/<id>.json although WAL is stored
+#      gzip + AES, and GET /api/v1/marks lists them in id order with labels.
+#   5. Recovery-window retention, run by a manual basebackup, deletes the mark
+#      whose WAL it deleted and keeps the marks whose WAL it kept.
+#   6. PGDATA is lost; the base backup is restored with
 #      recovery_target_lsn = <idle mark lsn>; recovery reaches the target,
 #      promotes, and the cluster holds exactly the rows written before it.
 #
 ###############################################################################
 
+# This test owns its own toxiproxy proxy so the latency toxic does not touch
+# 012's shared minio_s3 proxy when the suite runs in parallel. 012's reset at
+# its start still clears every toxic, but it runs seconds before ours is added.
+export TOXIPROXY_MINIO_PROXY="minio_s3_marks"
+export TOXIPROXY_MINIO_LISTEN="0.0.0.0:9006"
+MINIO_PROXY_URL="https://toxiproxy:9006"
+
 API_ADDR="${API_ADDR:-http://127.0.0.1:7070}"
 MARKS_URL="${API_ADDR}/api/v1/marks"
+BACKUPS_URL="${API_ADDR}/api/v1/backups"
+BASEBACKUP_START_URL="${API_ADDR}/api/v1/basebackup"
+BASEBACKUP_STATUS_URL="${API_ADDR}/api/v1/basebackup/status"
+RETENTION_WINDOW_SECONDS=3
 
 x_remake_config() {
   cat <<EOF > "/tmp/config.json"
@@ -44,7 +58,13 @@ x_remake_config() {
     "add_source": true
   },
   "backup": {
-    "cron": "*/50 * * * *"
+    "cron": "59 23 31 12 *"
+  },
+  "retention": {
+    "enable": true,
+    "type": "recovery_window",
+    "value": "${RETENTION_WINDOW_SECONDS}s",
+    "keep_last": 1
   },
   "marks": {
     "wal_timeout": "60s"
@@ -59,7 +79,7 @@ x_remake_config() {
       "pass": "qwerty123"
     },
     "s3": {
-      "url": "https://minio:9000",
+      "url": "${MINIO_PROXY_URL}",
       "access_key_id": "minioadmin",
       "secret_access_key": "minioadmin123",
       "bucket": "${TEST_NAME}",
@@ -73,7 +93,7 @@ EOF
 }
 
 x_json_field() {
-  python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$1" "$2"
 }
 
 x_http_json() {
@@ -82,10 +102,14 @@ x_http_json() {
   curl -sS -X "${method}" -H "Content-Type: application/json" -o "${body_file}" -w "%{http_code}" "$@" "${url}"
 }
 
+x_bucket_find() {
+  minio-mc find "local/${TEST_NAME}" --name "$1" --insecure 2>/dev/null || true
+}
+
 x_wait_object_in_bucket() {
   local name="$1" timeout="${2:-60}" i
   for ((i = 0; i < timeout; i++)); do
-    if [[ -n "$(minio-mc find "local/${TEST_NAME}" --name "${name}" --insecure 2>/dev/null)" ]]; then
+    if [[ -n "$(x_bucket_find "${name}")" ]]; then
       return 0
     fi
     sleep 1
@@ -93,10 +117,62 @@ x_wait_object_in_bucket() {
   log_fatal "object ${name} did not appear in bucket ${TEST_NAME} within ${timeout}s"
 }
 
+x_toxiproxy_setup_marks_proxy() {
+  x_wait_toxiproxy_up
+  x_toxiproxy_delete_minio_proxy
+  x_toxiproxy_create_minio_proxy
+  x_toxiproxy_enable_minio
+}
+
+x_toxiproxy_slow_minio() {
+  log_info "adding ${1}ms of latency to minio through toxiproxy"
+  curl -fsS -X POST "${TOXIPROXY_API}/proxies/${TOXIPROXY_MINIO_PROXY}/toxics" \
+    -H 'Content-Type: application/json' \
+    -d "{\"name\": \"slow\", \"type\": \"latency\", \"stream\": \"upstream\", \"attributes\": {\"latency\": ${1}}}" >/dev/null
+}
+
+x_toxiproxy_unslow_minio() {
+  log_info "removing the latency toxic"
+  curl -fsS -X DELETE "${TOXIPROXY_API}/proxies/${TOXIPROXY_MINIO_PROXY}/toxics/slow" >/dev/null
+}
+
+# x_create_mark POSTs a mark with the given label (empty for none) into the
+# given file and fails unless the daemon answers 201.
+x_create_mark() {
+  local label="$1" out="$2" code
+  if [[ -n "${label}" ]]; then
+    code="$(x_http_json POST "${MARKS_URL}" "${out}" -d "{\"label\": \"${label}\"}")"
+  else
+    code="$(x_http_json POST "${MARKS_URL}" "${out}")"
+  fi
+  cat "${out}"
+  echo
+  if [[ "${code}" != "201" ]]; then
+    cat "${LOG_FILE}" || true
+    log_fatal "expected POST /api/v1/marks to return 201, got ${code}"
+  fi
+}
+
+x_wait_basebackup_finished() {
+  local timeout="${1:-180}" i status
+  for ((i = 1; i <= timeout; i++)); do
+    if [[ "$(x_http_json GET "${BASEBACKUP_STATUS_URL}" "/tmp/basebackup-status.json")" == "200" ]]; then
+      status="$(x_json_field /tmp/basebackup-status.json status)"
+      case "${status}" in
+        succeeded) return 0 ;;
+        failed) cat /tmp/basebackup-status.json; log_fatal "basebackup failed" ;;
+      esac
+    fi
+    sleep 1
+  done
+  log_fatal "basebackup did not finish in ${timeout}s"
+}
+
 x_test_marks() {
   echo_delim "cleanup"
   x_remake_dirs
   x_remake_config
+  x_toxiproxy_setup_marks_proxy
 
   echo_delim "start cluster"
   xpg_rebuild
@@ -110,40 +186,50 @@ x_test_marks() {
     log_fatal "stream API did not become ready"
   fi
 
-  echo_delim "creating backup"
+  echo_delim "first base backup"
   /usr/local/bin/pgrwl backup -c "/tmp/config.json"
 
-  echo_delim "rows before the mark"
+  echo_delim "rows before the early mark"
   psql -v ON_ERROR_STOP=1 -c "create table public.marked(n int);"
-  psql -v ON_ERROR_STOP=1 -c "insert into public.marked select generate_series(1, 100);"
+  psql -v ON_ERROR_STOP=1 -c "insert into public.marked select generate_series(1, 50);"
 
-  echo_delim "create a mark"
+  echo_delim "early mark, and a concurrent POST that must get 409"
+  x_toxiproxy_slow_minio 1000
+  x_create_mark "early" "/tmp/early-mark.json" &
+  local first_pid=$!
+  sleep 0.5
   local code
-  code="$(x_http_json POST "${MARKS_URL}" "/tmp/mark.json" -d '{"label": "after-100"}')"
-  cat "/tmp/mark.json"
-  if [[ "${code}" != "201" ]]; then
-    cat "${LOG_FILE}" || true
-    log_fatal "expected POST /api/v1/marks to return 201, got ${code}"
-  fi
+  code="$(x_http_json POST "${MARKS_URL}" "/tmp/conflict.json")"
+  cat "/tmp/conflict.json"
+  echo
+  [[ "${code}" == "409" ]] || log_fatal "expected a concurrent POST /api/v1/marks to return 409, got ${code}"
+  wait "${first_pid}"
+  x_toxiproxy_unslow_minio
 
-  local mark_id mark_lsn mark_wal mark_label
+  local early_id early_wal
+  early_id="$(x_json_field /tmp/early-mark.json id)"
+  early_wal="$(x_json_field /tmp/early-mark.json wal_file)"
+  log_info "early mark id=${early_id} wal=${early_wal}"
+
+  echo_delim "second base backup, so retention can anchor past the early mark"
+  /usr/local/bin/pgrwl backup -c "/tmp/config.json"
+  local backup_started_at
+  backup_started_at="$(date +%s)"
+
+  echo_delim "rows before the mark to restore to"
+  psql -v ON_ERROR_STOP=1 -c "insert into public.marked select generate_series(51, 100);"
+  x_create_mark "after-100" "/tmp/mark.json"
+
+  local mark_id mark_lsn mark_wal
   mark_id="$(x_json_field /tmp/mark.json id)"
   mark_lsn="$(x_json_field /tmp/mark.json lsn)"
   mark_wal="$(x_json_field /tmp/mark.json wal_file)"
-  mark_label="$(x_json_field /tmp/mark.json label)"
   log_info "mark id=${mark_id} lsn=${mark_lsn} wal=${mark_wal}"
   [[ "${mark_id}" == *"-${mark_wal}" ]] || log_fatal "mark id ${mark_id} does not end with ${mark_wal}"
-  [[ "${mark_label}" == "after-100" ]] || log_fatal "mark label is ${mark_label}"
 
-  echo_delim "mark and its segment are in the bucket"
-  x_wait_object_in_bucket "${mark_wal}*" 5
-  x_wait_object_in_bucket "${mark_id}.json" 5
-
-  echo_delim "create a second mark while the instance is idle"
+  echo_delim "idle mark: nothing written since the last switch"
   sleep 1
-  code="$(x_http_json POST "${MARKS_URL}" "/tmp/idle-mark.json")"
-  cat "/tmp/idle-mark.json"
-  [[ "${code}" == "201" ]] || log_fatal "expected the idle POST /api/v1/marks to return 201, got ${code}"
+  x_create_mark "" "/tmp/idle-mark.json"
 
   local idle_id idle_lsn idle_wal
   idle_id="$(x_json_field /tmp/idle-mark.json id)"
@@ -151,31 +237,80 @@ x_test_marks() {
   idle_wal="$(x_json_field /tmp/idle-mark.json wal_file)"
   log_info "idle mark id=${idle_id} lsn=${idle_lsn} wal=${idle_wal}"
   [[ "${idle_wal}" > "${mark_wal}" ]] || log_fatal "idle mark reused segment ${idle_wal}; expected one after ${mark_wal}"
-  x_wait_object_in_bucket "${idle_wal}*" 5
 
-  echo_delim "list marks"
+  echo_delim "marks are plain JSON in the bucket while WAL is gzip + AES"
+  x_wait_object_in_bucket "${mark_wal}*" 5
+  x_wait_object_in_bucket "${idle_wal}*" 5
+  local wal_key mark_key
+  wal_key="$(x_bucket_find "${mark_wal}*")"
+  mark_key="$(x_bucket_find "${mark_id}.json")"
+  log_info "wal key=${wal_key} mark key=${mark_key}"
+  [[ "${wal_key}" == *"/${mark_wal}.gz.aes" ]] || log_fatal "WAL object ${wal_key} is not gzip + AES"
+  [[ "${mark_key}" == *"/marks/${mark_id}.json" ]] || log_fatal "mark object ${mark_key} is not marks/<id>.json"
+  minio-mc cat "${mark_key}" --insecure > /tmp/mark-from-bucket.json
+  cat /tmp/mark-from-bucket.json
+  echo
+  [[ "$(x_json_field /tmp/mark-from-bucket.json lsn)" == "${mark_lsn}" ]] \
+    || log_fatal "mark object in the bucket is not the plain JSON the API returned"
+
+  echo_delim "list marks: id order, labels"
   code="$(x_http_json GET "${MARKS_URL}" "/tmp/marks.json")"
   cat "/tmp/marks.json"
+  echo
   [[ "${code}" == "200" ]] || log_fatal "expected GET /api/v1/marks to return 200, got ${code}"
-  python3 - "/tmp/marks.json" "${mark_id}" "${idle_id}" <<'PY'
+  python3 - "/tmp/marks.json" "${early_id}" "${mark_id}" "${idle_id}" <<'PY'
 import json, sys
 marks = json.load(open(sys.argv[1]))
 assert [m["id"] for m in marks] == sys.argv[2:], marks
+assert [m["id"] for m in marks] == sorted(m["id"] for m in marks), marks
+assert [m.get("label") for m in marks] == ["early", "after-100", None], marks
 PY
 
-  echo_delim "rows after the mark, archived before the restore"
+  echo_delim "rows after the marks, archived before the restore"
   psql -v ON_ERROR_STOP=1 -c "insert into public.marked select generate_series(101, 300);"
   local after_wal
   after_wal="$(psql -At -c "select pg_walfile_name(pg_current_wal_insert_lsn());")"
   psql -v ON_ERROR_STOP=1 -c "select pg_switch_wal();" >/dev/null
   x_wait_object_in_bucket "${after_wal}*" 60
 
+  echo_delim "retention through a manual basebackup"
+  local restore_backup_id
+  code="$(x_http_json GET "${BACKUPS_URL}" "/tmp/backups.json")"
+  [[ "${code}" == "200" ]] || log_fatal "expected GET /api/v1/backups to return 200, got ${code}"
+  restore_backup_id="$(python3 -c 'import json, sys; print(max(b["label"] for b in json.load(open(sys.argv[1])) if b["status"] == "completed").removeprefix("pgrwl_"))' /tmp/backups.json)"
+  log_info "second backup id=${restore_backup_id}"
+  # The second backup has to fall outside the recovery window to become the anchor.
+  local elapsed
+  elapsed=$(( $(date +%s) - backup_started_at ))
+  if (( elapsed <= RETENTION_WINDOW_SECONDS )); then
+    sleep $(( RETENTION_WINDOW_SECONDS - elapsed + 1 ))
+  fi
+  code="$(x_http_json POST "${BASEBACKUP_START_URL}" "/tmp/basebackup-start.json")"
+  [[ "${code}" == "200" ]] || log_fatal "expected POST /api/v1/basebackup to return 200, got ${code}"
+  x_wait_basebackup_finished 180
+
+  echo_delim "retention deleted the early mark with its WAL and kept the rest"
+  [[ -z "$(x_bucket_find "${early_wal}*")" ]] || log_fatal "retention kept WAL ${early_wal}"
+  [[ -z "$(x_bucket_find "${early_id}.json")" ]] || log_fatal "retention kept the early mark although its WAL went"
+  [[ -n "$(x_bucket_find "${mark_wal}*")" ]] || log_fatal "retention deleted WAL ${mark_wal}"
+  [[ -n "$(x_bucket_find "${mark_id}.json")" ]] || log_fatal "retention deleted the mark whose WAL stayed"
+  [[ -n "$(x_bucket_find "${idle_id}.json")" ]] || log_fatal "retention deleted the idle mark whose WAL stayed"
+  code="$(x_http_json GET "${MARKS_URL}" "/tmp/marks-after-retention.json")"
+  cat "/tmp/marks-after-retention.json"
+  echo
+  [[ "${code}" == "200" ]] || log_fatal "expected GET /api/v1/marks to return 200, got ${code}"
+  python3 - "/tmp/marks-after-retention.json" "${mark_id}" "${idle_id}" <<'PY'
+import json, sys
+marks = json.load(open(sys.argv[1]))
+assert [m["id"] for m in marks] == sys.argv[2:], marks
+PY
+
   echo_delim "teardown"
   x_stop_receiver
   xpg_teardown
 
-  echo_delim "restoring backup to the idle mark"
-  /usr/local/bin/pgrwl restore --dest="${PGDATA}" -c "/tmp/config.json"
+  echo_delim "restoring the second backup to the idle mark"
+  /usr/local/bin/pgrwl restore --id="${restore_backup_id}" --dest="${PGDATA}" -c "/tmp/config.json"
   chmod 0750 "${PGDATA}"
   chown -R postgres:postgres "${PGDATA}"
   touch "${PGDATA}/recovery.signal"
