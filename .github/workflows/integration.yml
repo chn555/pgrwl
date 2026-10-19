@@ -44,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg_major: [17, 18]
+        pg_major: [15, 17, 18]
 
     env:
       PG_MAJOR: ${{ matrix.pg_major }}
@@ -160,7 +160,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg_major: [17, 18]
+        pg_major: [15, 17, 18]
         # One entry per test service in docker-compose-par.yml
         test_name:
           - pg_001_fundamental
