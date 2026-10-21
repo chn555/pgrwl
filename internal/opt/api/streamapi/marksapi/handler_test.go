@@ -15,18 +15,22 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/pgrwl/pgrwl/internal/opt/basebackup/backupdto"
 	"github.com/pgrwl/pgrwl/internal/opt/marks"
 	st "github.com/pgrwl/pgrwl/internal/opt/shared/storecrypt"
+	"github.com/pgrwl/pgrwl/internal/opt/supervisors/backupsv"
 )
 
 const testWAL = "000000010000000000000007"
 
-// The fixture wires a handler to in-memory WAL and mark storage and a scripted WAL switch.
+// The fixture wires a handler to in-memory WAL, mark and base backup storage and a
+// scripted WAL switch; the base backup starts in the test segment, so it alone is needed.
 type fixture struct {
 	handler  *Handler
 	svc      *svc
 	walFiles *st.InMemoryStorage
 	marks    *st.InMemoryStorage
+	backups  *st.InMemoryStorage
 }
 
 func newFixture(t *testing.T, switchWAL func(ctx context.Context) (*switchResult, error)) *fixture {
@@ -38,9 +42,15 @@ func newFixture(t *testing.T, switchWAL func(ctx context.Context) (*switchResult
 	require.NoError(t, err)
 
 	markFiles := st.NewInMemoryStorage()
+	backupFiles := st.NewInMemoryStorage()
+	base, err := json.Marshal(&backupdto.Result{StartLSN: 0x7000028, StopLSN: 0x7000100, TimelineID: 1, FinishedAt: time.Now()})
+	require.NoError(t, err)
+	require.NoError(t, backupFiles.Put(context.Background(), "b1/b1.json", bytes.NewReader(base)))
+
 	s := NewService(&Opts{
 		Store:      &marks.Store{Storage: markFiles},
 		WALStor:    walStor,
+		Backups:    backupsv.NewBackupStore(&backupsv.BackupSupervisorOpts{BasebackupStor: backupFiles}),
 		WALTimeout: 200 * time.Millisecond,
 	})
 	impl, ok := s.(*svc)
@@ -48,12 +58,12 @@ func newFixture(t *testing.T, switchWAL func(ctx context.Context) (*switchResult
 	impl.walPoll = 5 * time.Millisecond
 	impl.switchWAL = switchWAL
 
-	return &fixture{handler: NewHandler(s, impl.walTimeout), svc: impl, walFiles: walFiles, marks: markFiles}
+	return &fixture{handler: NewHandler(s, impl.walTimeout), svc: impl, walFiles: walFiles, marks: markFiles, backups: backupFiles}
 }
 
 // The switchToTestWAL stub stands in for pgSwitchWAL and always closes the same segment.
 func switchToTestWAL(context.Context) (*switchResult, error) {
-	return &switchResult{LSN: "0/7000028", WALFile: testWAL}, nil
+	return &switchResult{LSN: "0/7000028", WALFile: testWAL, WalSegSz: testWalSegSz}, nil
 }
 
 func (f *fixture) post(body string) *httptest.ResponseRecorder {
@@ -134,6 +144,50 @@ func TestCreateTimesOutWhenTheSegmentNeverArrives(t *testing.T) {
 	assert.Empty(t, f.marks.Files)
 }
 
+func TestCreateRefusesAMarkTheArchiveCannotReplayTo(t *testing.T) {
+	f := newFixture(t, func(context.Context) (*switchResult, error) {
+		return &switchResult{LSN: "0/9000028", WALFile: "000000010000000000000009", WalSegSz: testWalSegSz}, nil
+	})
+	require.NoError(t, f.walFiles.Put(context.Background(), testWAL, bytes.NewReader([]byte("wal"))))
+	require.NoError(t, f.walFiles.Put(context.Background(), "000000010000000000000009", bytes.NewReader([]byte("wal"))))
+
+	w := f.post("")
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	var body map[string]string
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "wal_gap", body["status"])
+	assert.Equal(t, "000000010000000000000008", body["missing"])
+	assert.Contains(t, body["error"], "000000010000000000000008")
+	assert.Empty(t, f.marks.Files)
+}
+
+func TestCreateRefusesAMarkWithoutABaseBackup(t *testing.T) {
+	f := newFixture(t, switchToTestWAL)
+	require.NoError(t, f.walFiles.Put(context.Background(), testWAL, bytes.NewReader([]byte("wal"))))
+	require.NoError(t, f.backups.Delete(context.Background(), "b1/b1.json"))
+
+	w := f.post("")
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.Contains(t, w.Body.String(), `"status":"wal_gap"`)
+	assert.NotContains(t, w.Body.String(), `"missing"`)
+	assert.Empty(t, f.marks.Files)
+}
+
+func TestCreateWaitsForTheSegmentsBeforeTheMark(t *testing.T) {
+	f := newFixture(t, func(context.Context) (*switchResult, error) {
+		return &switchResult{LSN: "0/8000028", WALFile: "000000010000000000000008", WalSegSz: testWalSegSz}, nil
+	})
+	require.NoError(t, f.walFiles.Put(context.Background(), "000000010000000000000008", bytes.NewReader([]byte("wal"))))
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		assert.NoError(t, f.walFiles.Put(context.Background(), testWAL, bytes.NewReader([]byte("wal"))))
+	}()
+
+	assert.Equal(t, http.StatusCreated, f.post("").Code, "the base's segment arrived after the mark's")
+}
+
 func TestCreateReportsASwitchFailure(t *testing.T) {
 	f := newFixture(t, func(context.Context) (*switchResult, error) {
 		return nil, errors.New("permission denied for function pg_switch_wal")
@@ -152,7 +206,7 @@ func TestCreateRefusesASecondMarkWhileOneIsInProgress(t *testing.T) {
 	f := newFixture(t, func(context.Context) (*switchResult, error) {
 		enteredOnce.Do(func() { close(entered) })
 		<-release
-		return &switchResult{LSN: "0/7000028", WALFile: testWAL}, nil
+		return &switchResult{LSN: "0/7000028", WALFile: testWAL, WalSegSz: testWalSegSz}, nil
 	})
 	require.NoError(t, f.walFiles.Put(context.Background(), testWAL, bytes.NewReader([]byte("wal"))))
 

@@ -19,9 +19,12 @@
 
 `POST /api/v1/marks` records the current WAL insert position, writes a restore
 point, switches WAL, and waits (up to `marks.wal_timeout`) until the closed
-segment has reached storage. It answers `201` with the mark, `409` while another
-mark is in progress, and `504` if the segment does not arrive in time. The body
-is optional: `{"label": "before-upgrade"}`.
+segment has reached storage and the archive holds every segment from the newest
+base backup to it. It answers `201` with the mark, `409` with `"status":
+"in_progress"` while another mark is in progress, `409` with `"status":
+"wal_gap"` and the first `"missing"` file when a restore could not replay to it
+(take a base backup, then mark again), and `504` if the segment does not arrive
+in time. The body is optional: `{"label": "before-upgrade"}`.
 
 ```json
 {

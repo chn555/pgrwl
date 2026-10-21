@@ -195,6 +195,7 @@ func RunReceiveMode(opts *ReceiveModeOpts) error {
 			Marks: &marksapi.Opts{
 				Store:      &marks.Store{Storage: comp.markStor},
 				WALStor:    comp.walStor,
+				Backups:    comp.backupStore,
 				WALTimeout: cfg.Marks.WALTimeoutParsed,
 			},
 			Cfg: cfg,
@@ -302,6 +303,7 @@ type components struct {
 	pgrw                 xlog.PgReceiveWal
 	walStor              *st.VariadicStorage
 	markStor             st.Storage
+	backupStore          backupsv.BackupStore
 	basebackupSupervisor backupsv.BaseBackupSupervisor
 }
 
@@ -354,14 +356,15 @@ func initComponents(
 		return nil, fmt.Errorf("init marks storage: %w", err)
 	}
 
-	basebackupSupervisor, err := backupsv.NewBaseBackupSupervisor(&backupsv.BackupSupervisorOpts{
+	backupOpts := &backupsv.BackupSupervisorOpts{
 		Directory:      opts.ReceiveDirectory,
 		WalSegSz:       walSegSz,
 		BasebackupStor: basebackupStor,
 		WalStor:        walStor,
 		MarkStor:       markStor,
 		Cfg:            cfg,
-	})
+	}
+	basebackupSupervisor, err := backupsv.NewBaseBackupSupervisor(backupOpts)
 	if err != nil {
 		return nil, fmt.Errorf("init basebackup supervisor: %w", err)
 	}
@@ -370,6 +373,7 @@ func initComponents(
 		pgrw:                 pgrw,
 		walStor:              walStor,
 		markStor:             markStor,
+		backupStore:          backupsv.NewBackupStore(backupOpts),
 		basebackupSupervisor: basebackupSupervisor,
 	}, nil
 }

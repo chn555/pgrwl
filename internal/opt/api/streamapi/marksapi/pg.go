@@ -3,14 +3,17 @@ package marksapi
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// The switchResult names the LSN a mark restores to and the archived segment that holds it.
+// The switchResult names the LSN a mark restores to, the archived segment that holds it,
+// and the server's segment size, which the chain check needs to name segments.
 type switchResult struct {
-	LSN     string
-	WALFile string
+	LSN      string
+	WALFile  string
+	WalSegSz uint64
 }
 
 // The pgSwitchWAL function writes a restore point, then closes the segment so the archive holds a record at or past LSN.
@@ -32,8 +35,16 @@ func pgSwitchWAL(ctx context.Context) (*switchResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	segSz, err := queryString(ctx, conn, "SELECT setting FROM pg_settings WHERE name = 'wal_segment_size'")
+	if err != nil {
+		return nil, err
+	}
+	walSegSz, err := strconv.ParseUint(segSz, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("wal_segment_size %q: %w", segSz, err)
+	}
 
-	return &switchResult{LSN: lsn, WALFile: walFile}, nil
+	return &switchResult{LSN: lsn, WALFile: walFile, WalSegSz: walSegSz}, nil
 }
 
 // The queryString function runs a single-row, single-column query.

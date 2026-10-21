@@ -10,5 +10,6 @@ import (
 type Opts struct {
 	Store      *marks.Store
 	WALStor    *st.VariadicStorage
+	Backups    BackupLister
 	WALTimeout time.Duration
 }

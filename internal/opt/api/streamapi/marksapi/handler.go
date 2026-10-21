@@ -84,25 +84,26 @@ func writeBadRequest(w http.ResponseWriter, err error) {
 }
 
 func writeCreateError(w http.ResponseWriter, err error) {
+	body := map[string]any{"error": err.Error()}
+	code := http.StatusInternalServerError
+
+	var gap *GapError
 	switch {
 	case errors.Is(err, ErrMarkInProgress):
-		httpx.WriteJSON(w, http.StatusConflict, map[string]any{
-			"status": "in_progress",
-			"error":  err.Error(),
-		})
+		body["status"], code = "in_progress", http.StatusConflict
+
+	case errors.As(err, &gap):
+		body["status"], code = "wal_gap", http.StatusConflict
+		if gap.Missing != "" {
+			body["missing"] = gap.Missing
+		}
 
 	case errors.Is(err, ErrWALTimeout):
-		httpx.WriteJSON(w, http.StatusGatewayTimeout, map[string]any{
-			"status": "timeout",
-			"error":  err.Error(),
-		})
+		body["status"], code = "timeout", http.StatusGatewayTimeout
 
 	default:
 		slog.Error("mark creation failed", slog.Any("err", err))
-
-		httpx.WriteJSON(w, http.StatusInternalServerError, map[string]any{
-			"status": "error",
-			"error":  err.Error(),
-		})
+		body["status"] = "error"
 	}
+	httpx.WriteJSON(w, code, body)
 }
