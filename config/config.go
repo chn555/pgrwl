@@ -130,7 +130,7 @@ type RetentionConfig struct {
 
 	KeepDurationParsed time.Duration `json:"-"`
 
-	KeepLast *int `json:"keep_last,omitzero" env:"PGRWL_BACKUP_RETENTION_KEEP_LAST"`
+	KeepLast *int `json:"keep_last,omitzero" env:"PGRWL_BACKUP_RETENTION_KEEP_LAST,noinit"`
 }
 
 // MarksConfig configures the marks API served in receive mode.

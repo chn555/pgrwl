@@ -183,6 +183,20 @@ func TestFromEnvsAppliesOverridesAndParsesValues(t *testing.T) {
 	assert.True(t, Verbose)
 }
 
+func TestFromEnvsLeavesKeepLastUnsetWithRetentionByEnv(t *testing.T) {
+	resetConfigForTest(t)
+	setValidReceiveEnvForTest(t)
+	t.Setenv("PGRWL_BACKUP_CRON", "0 2 * * *")
+	t.Setenv("PGRWL_BACKUP_RETENTION_ENABLE", "true")
+	t.Setenv("PGRWL_BACKUP_RETENTION_TYPE", RetentionTypeRecoveryWindow)
+	t.Setenv("PGRWL_BACKUP_RETENTION_VALUE", "168h")
+
+	cfg, err := FromEnvs(ModeReceive)
+	assert.NoError(t, err)
+	assert.Nil(t, cfg.Retention.KeepLast)
+	assert.Equal(t, 168*time.Hour, cfg.Retention.KeepDurationParsed)
+}
+
 func TestFromEnvsInvalidValuesReturnErrors(t *testing.T) {
 	resetConfigForTest(t)
 	setValidReceiveEnvForTest(t)
