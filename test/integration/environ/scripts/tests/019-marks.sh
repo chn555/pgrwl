@@ -17,8 +17,11 @@ set -euo pipefail
 #      gzip + AES, and GET /api/v1/marks lists them in id order with labels.
 #   5. Recovery-window retention, run by a manual basebackup, deletes the mark
 #      whose WAL it deleted and keeps the marks whose WAL it kept.
-#   6. PGDATA is lost; the base backup is restored with
-#      recovery_target_lsn = <idle mark lsn>; recovery reaches the target,
+#   6. With a segment between the newest base backup and the mark gone from
+#      the bucket, POST /api/v1/marks answers 409 wal_gap naming it; a base
+#      backup taken after the hole cures it and the next mark answers 201.
+#   7. PGDATA is lost; that base backup is restored with
+#      recovery_target_lsn = <cured mark lsn>; recovery reaches the target,
 #      promotes, and the cluster holds exactly the rows written before it.
 #
 ###############################################################################
@@ -67,7 +70,7 @@ x_remake_config() {
     "keep_last": 1
   },
   "marks": {
-    "wal_timeout": "60s"
+    "wal_timeout": "30s"
   },
   "storage": {
     "name": "s3",
@@ -305,12 +308,45 @@ marks = json.load(open(sys.argv[1]))
 assert [m["id"] for m in marks] == sys.argv[2:], marks
 PY
 
+  echo_delim "a segment after the newest base backup goes missing from the bucket"
+  psql -v ON_ERROR_STOP=1 -c "insert into public.marked select generate_series(301, 400);"
+  local hole_wal hole_key
+  hole_wal="$(psql -At -c "select pg_walfile_name(pg_current_wal_insert_lsn());")"
+  psql -v ON_ERROR_STOP=1 -c "select pg_switch_wal();" >/dev/null
+  x_wait_object_in_bucket "${hole_wal}*" 60
+  hole_key="$(x_bucket_find "${hole_wal}*")"
+  log_info "removing ${hole_key}"
+  minio-mc rm "${hole_key}" --insecure
+
+  echo_delim "the mark is refused with 409 wal_gap naming the missing segment"
+  code="$(x_http_json POST "${MARKS_URL}" "/tmp/gap.json" -d '{"label": "past-the-hole"}')"
+  cat "/tmp/gap.json"
+  echo
+  [[ "${code}" == "409" ]] || log_fatal "expected POST /api/v1/marks past a hole to return 409, got ${code}"
+  [[ "$(x_json_field /tmp/gap.json status)" == "wal_gap" ]] || log_fatal "expected status wal_gap"
+  [[ "$(x_json_field /tmp/gap.json missing)" == "${hole_wal}" ]] || log_fatal "expected missing ${hole_wal}"
+  [[ -z "$(x_bucket_find "*past-the-hole*")" ]] || log_fatal "a refused mark was stored"
+
+  echo_delim "a base backup after the hole cures it"
+  code="$(x_http_json POST "${BASEBACKUP_START_URL}" "/tmp/basebackup-start.json")"
+  [[ "${code}" == "200" ]] || log_fatal "expected POST /api/v1/basebackup to return 200, got ${code}"
+  x_wait_basebackup_finished 180
+  local cured_backup_id
+  code="$(x_http_json GET "${BACKUPS_URL}" "/tmp/backups.json")"
+  [[ "${code}" == "200" ]] || log_fatal "expected GET /api/v1/backups to return 200, got ${code}"
+  cured_backup_id="$(python3 -c 'import json, sys; print(max(b["label"] for b in json.load(open(sys.argv[1])) if b["status"] == "completed").removeprefix("pgrwl_"))' /tmp/backups.json)"
+  log_info "cured backup id=${cured_backup_id}"
+  x_create_mark "cured" "/tmp/cured-mark.json"
+  local cured_lsn
+  cured_lsn="$(x_json_field /tmp/cured-mark.json lsn)"
+  log_info "cured mark lsn=${cured_lsn}"
+
   echo_delim "teardown"
   x_stop_receiver
   xpg_teardown
 
-  echo_delim "restoring the second backup to the idle mark"
-  /usr/local/bin/pgrwl restore --id="${restore_backup_id}" --dest="${PGDATA}" -c "/tmp/config.json"
+  echo_delim "restoring the cured backup to the cured mark"
+  /usr/local/bin/pgrwl restore --id="${cured_backup_id}" --dest="${PGDATA}" -c "/tmp/config.json"
   chmod 0750 "${PGDATA}"
   chown -R postgres:postgres "${PGDATA}"
   touch "${PGDATA}/recovery.signal"
@@ -318,7 +354,7 @@ PY
   xpg_config
   cat <<EOF >>"${PG_CFG}"
 restore_command = 'pgrwl restore-command --serve-addr=127.0.0.1:7070 %f %p'
-recovery_target_lsn = '${idle_lsn}'
+recovery_target_lsn = '${cured_lsn}'
 recovery_target_action = 'promote'
 EOF
 
@@ -331,8 +367,8 @@ EOF
   cat /var/log/postgresql/pg.log
 
   echo_delim "verify the restored state"
-  grep -q "recovery stopping after WAL location (LSN) \"${idle_lsn}\"" /var/log/postgresql/pg.log \
-    || log_fatal "recovery did not stop at ${idle_lsn}"
+  grep -q "recovery stopping after WAL location (LSN) \"${cured_lsn}\"" /var/log/postgresql/pg.log \
+    || log_fatal "recovery did not stop at ${cured_lsn}"
   if grep -q "recovery ended before configured recovery target was reached" /var/log/postgresql/pg.log; then
     log_fatal "recovery ran out of WAL before the mark"
   fi
@@ -341,7 +377,7 @@ EOF
   rows="$(psql -At -c "select count(*) from public.marked;")"
   timeline="$(psql -At -c "select timeline_id from pg_control_checkpoint();")"
   log_info "rows=${rows} timeline=${timeline}"
-  [[ "${rows}" == "100" ]] || log_fatal "expected 100 rows at the idle mark, got ${rows}"
+  [[ "${rows}" == "400" ]] || log_fatal "expected 400 rows at the cured mark, got ${rows}"
   [[ "${timeline}" == "2" ]] || log_fatal "expected timeline 2 after promote, got ${timeline}"
 
   echo_delim "check logs"
